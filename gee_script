@@ -1,0 +1,187 @@
+// ============================================================
+//  Delhi NCR Construction Detection — Google Earth Engine
+//  Paste this entire script into code.earthengine.google.com
+//  Then click RUN → check Tasks tab → click RUN on the task
+// ============================================================
+
+// ── 1. Define Delhi NCR Boundary (tight, accurate) ───────────────────
+var delhiNCR = ee.Geometry.Polygon([[
+  [76.84, 28.88],   // NW corner (Rohtak side)
+  [77.55, 28.88],   // NE corner (Meerut side)
+  [77.55, 28.25],   // SE corner (Palwal side)
+  [76.84, 28.25],   // SW corner (Rewari side)
+  [76.84, 28.88]    // close polygon
+]]);
+
+// Visual confirmation — you should see a box over Delhi NCR on the map
+Map.centerObject(delhiNCR, 10);
+Map.addLayer(delhiNCR, {color: 'white'}, 'Delhi NCR Boundary', false);
+
+
+// ── 2. Helper: Load clean Sentinel-2 composite ───────────────────────
+function getS2Composite(startDate, endDate) {
+  return ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(delhiNCR)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 15))
+    .map(function(img) {
+      // Mask clouds using QA60 band
+      var qa = img.select('QA60');
+      var cloudBitMask  = 1 << 10;
+      var cirrusBitMask = 1 << 11;
+      var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+                   .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+      return img.updateMask(mask)
+                .divide(10000)          // scale to reflectance 0-1
+                .copyProperties(img, ['system:time_start']);
+    })
+    .median()
+    .clip(delhiNCR);
+}
+
+// ── 3. Load Before & After images (same season, different year) ───────
+//  Same season = avoids false positives from crop/vegetation cycles
+var before = getS2Composite('2022-11-01', '2023-01-31');  // Winter 2022-23
+var after  = getS2Composite('2023-11-01', '2024-01-31');  // Winter 2023-24
+
+// ── 4. Compute Spectral Indices ───────────────────────────────────────
+
+// NDVI = vegetation (drops when construction clears land)
+var ndvi_before = before.normalizedDifference(['B8', 'B4']).rename('NDVI_before');
+var ndvi_after  = after.normalizedDifference(['B8', 'B4']).rename('NDVI_after');
+
+// NDBI = built-up index (rises when construction starts)
+var ndbi_before = before.normalizedDifference(['B11', 'B8']).rename('NDBI_before');
+var ndbi_after  = after.normalizedDifference(['B11', 'B8']).rename('NDBI_after');
+
+// BSI = Bare Soil Index (rises when soil is exposed for construction)
+// BSI = (SWIR1 + Red - NIR - Blue) / (SWIR1 + Red + NIR + Blue)
+var bsi_before = before.expression(
+  '((SWIR + RED) - (NIR + BLUE)) / ((SWIR + RED) + (NIR + BLUE))',
+  { SWIR: before.select('B11'), RED: before.select('B4'),
+    NIR: before.select('B8'),   BLUE: before.select('B2') }
+).rename('BSI_before');
+
+var bsi_after = after.expression(
+  '((SWIR + RED) - (NIR + BLUE)) / ((SWIR + RED) + (NIR + BLUE))',
+  { SWIR: after.select('B11'), RED: after.select('B4'),
+    NIR: after.select('B8'),   BLUE: after.select('B2') }
+).rename('BSI_after');
+
+// ── 5. Compute Change Scores ──────────────────────────────────────────
+var ndvi_drop = ndvi_before.subtract(ndvi_after);   // positive = lost vegetation
+var ndbi_rise = ndbi_after.subtract(ndbi_before);   // positive = new built-up
+var bsi_rise  = bsi_after.subtract(bsi_before);     // positive = new bare soil
+
+// Combined construction score (weighted sum)
+//  High score = vegetation dropped AND built-up/bare soil increased
+var construction_score = ndvi_drop.multiply(0.4)
+  .add(ndbi_rise.multiply(0.35))
+  .add(bsi_rise.multiply(0.25))
+  .rename('construction_score');
+
+// ── 6. Threshold → Binary Construction Mask ──────────────────────────
+//  Threshold of 0.08 works well for Delhi winters.
+//  If you get too many/few detections, adjust this value.
+var THRESHOLD = 0.08;
+var construction_mask = construction_score.gt(THRESHOLD);
+
+// ── 7. Convert pixels → vector polygons ──────────────────────────────
+var raw_vectors = construction_mask.selfMask()
+  .reduceToVectors({
+    geometry    : delhiNCR,
+    scale       : 20,               // 20m resolution — good balance of detail vs file size
+    geometryType: 'polygon',
+    eightConnected: true,
+    maxPixels   : 1e10,
+    reducer     : ee.Reducer.countEvery()
+  });
+
+// ── 8. Compute per-polygon statistics ────────────────────────────────
+var vectors_with_stats = raw_vectors.map(function(feat) {
+  var geom = feat.geometry();
+
+  var score_val = construction_score.reduceRegion({
+    reducer  : ee.Reducer.mean(),
+    geometry : geom,
+    scale    : 20,
+    maxPixels: 1e8
+  }).get('construction_score');
+
+  var area_ha = geom.area(1).divide(10000);   // ← 1 metre maxError added here
+
+  var score_num = ee.Number(score_val);
+  var intensity = ee.Algorithms.If(
+    score_num.gte(0.20), 'High',
+    ee.Algorithms.If(score_num.gte(0.13), 'Medium', 'Low')
+  );
+
+  return feat
+    .set('construction_score', score_val)
+    .set('area_ha', area_ha)
+    .set('intensity', intensity)
+    .set('source', 'Sentinel-2 S2_SR_HARMONIZED')
+    .set('before_period', '2022-11-01 to 2023-01-31')
+    .set('after_period',  '2023-11-01 to 2024-01-31')
+    .set('threshold_used', THRESHOLD);
+});
+
+// ── 9. Filter: keep only meaningful polygons ─────────────────────────
+//  Remove tiny fragments (< 0.05 ha = ~500 sq m = noise)
+var final_sites = vectors_with_stats
+  .filter(ee.Filter.gt('area_ha', 0.05))
+  .filter(ee.Filter.gt('count', 5));  // at least 5 changed pixels
+
+// ── 10. Visualise on map ──────────────────────────────────────────────
+var scoreViz = {
+  min    : 0,
+  max    : 0.3,
+  palette: ['#ffffcc', '#fd8d3c', '#e31a1c', '#800026']
+};
+
+Map.addLayer(construction_score.updateMask(construction_mask),
+  scoreViz, 'Construction Score', true);
+
+Map.addLayer(final_sites, {color: 'FF4444'}, 'Construction Sites (vectors)', true);
+
+print('Total construction sites detected:', final_sites.size());
+print('Sample feature:', final_sites.first());
+
+// ── 11. Add legend ────────────────────────────────────────────────────
+var legend = ui.Panel({style: {position: 'bottom-left', padding: '8px 12px'}});
+legend.add(ui.Label('Construction Intensity', {fontWeight: 'bold', fontSize: '13px'}));
+[['High  (score ≥ 0.20)', '#800026'],
+ ['Medium (0.13–0.20)',   '#e31a1c'],
+ ['Low   (< 0.13)',       '#fd8d3c']].forEach(function(item) {
+  var row = ui.Panel({layout: ui.Panel.Layout.flow('horizontal')});
+  row.add(ui.Label('', {backgroundColor: item[1], padding: '8px', margin: '2px'}));
+  row.add(ui.Label(item[0], {margin: '4px 6px'}));
+  legend.add(row);
+});
+Map.add(legend);
+
+
+// ── 12. Export GeoJSON to Google Drive ───────────────────────────────
+//  After clicking RUN:
+//  1. Go to Tasks tab (top right)
+//  2. Click RUN next to "delhi_ncr_construction_sites_v2"
+//  3. File will appear in your Google Drive → download it
+Export.table.toDrive({
+  collection : final_sites,
+  description: 'delhi_ncr_construction_sites_v2',
+  folder     : 'GEE_Delhi_Construction',
+  fileFormat : 'GeoJSON',
+  selectors  : [
+    '.geo',                  // geometry (the polygon)
+    'count',                 // pixel count
+    'area_ha',               // area in hectares
+    'construction_score',    // mean score
+    'intensity',             // High / Medium / Low
+    'source',
+    'before_period',
+    'after_period',
+    'threshold_used'
+  ]
+});
+
+print('✅ Export task created. Go to Tasks tab → click RUN to start download.');
